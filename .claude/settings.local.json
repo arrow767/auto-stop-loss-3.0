@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir \"C:\\\\softs\\\\auto_stop_loss_2.0\")",
+      "Bash(dir /s \"C:\\\\softs\\\\auto_stop_loss_2.0\")",
+      "Bash(powershell -Command:*)",
+      "Bash(bun run:*)",
+      "Bash(bun build:*)"
+    ]
+  }
+}

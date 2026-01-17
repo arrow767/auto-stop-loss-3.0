@@ -1,0 +1,39 @@
+services:
+  - type: web
+    name: binance-loss-guardian
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    envVars:
+      - key: BINANCE_API_KEY
+        sync: false
+      - key: BINANCE_API_SECRET
+        sync: false
+      - key: MAX_LOSS_USD
+        value: 100
+      - key: INTERVAL_MS
+        value: 1000
+      - key: RECV_WINDOW
+        value: 5000
+      - key: BASE_URL
+        value: https://fapi.binance.com
+      - key: DRY_RUN
+        value: false
+      - key: SHOW_ALL
+        value: true
+      - key: HEALTHCHECK_PORT
+        value: 3000
+      - key: MAX_RESTART_ATTEMPTS
+        value: 10
+      - key: RESTART_BACKOFF_MS
+        value: 5000
+      - key: ENABLE_TELEGRAM_NOTIFICATIONS
+        value: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: TELEGRAM_NOTIFICATION_INTERVAL_MS
+        value: 15000
+    healthCheckPath: /health
+    autoDeploy: true
