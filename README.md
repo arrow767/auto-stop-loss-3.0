@@ -29,36 +29,7 @@
 bun install
 ```
 
-### Переменные окружения
-
-Создайте файл `.env` в корне проекта:
-
-```env
-# Обязательные
-BINANCE_API_KEY=your_api_key_here
-BINANCE_API_SECRET=your_api_secret_here
-
-# Опциональные (значения по умолчанию)
-MAX_LOSS_USD=100              # Максимальный убыток в USDT перед закрытием
-INTERVAL_MS=1000              # Интервал опроса позиций (мс)
-RECV_WINDOW=5000              # Окно получения запросов (мс)
-BASE_URL=https://fapi.binance.com
-DRY_RUN=false                 # Режим тестирования (не закрывает реально)
-SHOW_ALL=true                 # Показывать все позиции в логах
-LOG_SYMBOL_FILTER=            # Фильтр символов (через запятую, например: BTCUSDT,ETHUSDT)
-HEALTHCHECK_PORT=3000         # Порт для healthcheck endpoint
-MAX_RESTART_ATTEMPTS=10       # Максимум попыток перезапуска
-RESTART_BACKOFF_MS=5000       # Задержка перед перезапуском (мс)
-# Telegram уведомления (опционально)
-ENABLE_TELEGRAM_NOTIFICATIONS=false  # Включить уведомления в Telegram
-TELEGRAM_BOT_TOKEN=          # Токен бота от @BotFather
-TELEGRAM_CHAT_ID=             # ID чата или канала (можно получить у @userinfobot)
-TELEGRAM_NOTIFICATION_INTERVAL_MS=15000  # Интервал между уведомлениями (мс, минимум 5 сек)
-```
-
-## Запуск
-
-### Локально (Windows/WSL/Linux)
+To run:
 
 ```bash
 # Запуск с Bun

@@ -306,8 +306,10 @@ class PositionMonitor {
       } catch (e) {
         this.errors++;
         logError(`Tick: ${e.message}`);
-        if (this.errors >= 10)
-          throw e;
+        if (this.errors >= 10) {
+          logWarn(`${this.errors} \u043E\u0448\u0438\u0431\u043E\u043A \u043F\u043E\u0434\u0440\u044F\u0434, \u0436\u0434\u0451\u043C 30 \u0441\u0435\u043A\u0443\u043D\u0434...`);
+          await sleep(30000);
+        }
       }
       await sleep(cfg.intervalMs);
     }
@@ -326,10 +328,12 @@ class PositionMonitor {
     this.positions = await this.api.getPositions();
     this.printPositions();
     for (const pos of this.positions) {
-      const loss = -pos.pnl;
-      if (loss >= cfg.maxLossUsd) {
-        logError(`${pos.symbol} \u0423\u0411\u042B\u0422\u041E\u041A ${loss.toFixed(2)} >= ${cfg.maxLossUsd} USDT - \u0417\u0410\u041A\u0420\u042B\u0412\u0410\u0415\u041C!`);
-        await this.closePosition(pos);
+      if (pos.pnl < 0) {
+        const loss = Math.abs(pos.pnl);
+        if (loss >= cfg.maxLossUsd) {
+          logError(`${pos.symbol} \u0423\u0411\u042B\u0422\u041E\u041A ${loss.toFixed(2)} >= ${cfg.maxLossUsd} USDT - \u0417\u0410\u041A\u0420\u042B\u0412\u0410\u0415\u041C!`);
+          await this.closePosition(pos);
+        }
       }
     }
   }
@@ -362,7 +366,7 @@ class PositionMonitor {
       try {
         const algoOrders = await this.api.getAlgoOrders(pos.symbol);
         for (const order of algoOrders) {
-          if (order.status === "NEW") {
+          if (order.algoStatus === "NEW") {
             await this.api.cancelAlgoOrder(pos.symbol, order.algoId);
           }
         }

@@ -404,7 +404,11 @@ class PositionMonitor {
       } catch (e: any) {
         this.errors++;
         logError(`Tick: ${e.message}`);
-        if (this.errors >= 10) throw e;
+        // При множественных ошибках ждём дольше, но НЕ падаем
+        if (this.errors >= 10) {
+          logWarn(`${this.errors} ошибок подряд, ждём 30 секунд...`);
+          await sleep(30000);
+        }
       }
       await sleep(cfg.intervalMs);
     }
@@ -427,10 +431,14 @@ class PositionMonitor {
     this.printPositions();
 
     for (const pos of this.positions) {
-      const loss = -pos.pnl;
-      if (loss >= cfg.maxLossUsd) {
-        logError(`${pos.symbol} УБЫТОК ${loss.toFixed(2)} >= ${cfg.maxLossUsd} USDT - ЗАКРЫВАЕМ!`);
-        await this.closePosition(pos);
+      // КРИТИЧНО: закрываем ТОЛЬКО если pnl отрицательный И убыток >= maxLoss
+      // pnl < 0 = убыток, pnl > 0 = прибыль
+      if (pos.pnl < 0) {
+        const loss = Math.abs(pos.pnl);  // убыток как положительное число
+        if (loss >= cfg.maxLossUsd) {
+          logError(`${pos.symbol} УБЫТОК ${loss.toFixed(2)} >= ${cfg.maxLossUsd} USDT - ЗАКРЫВАЕМ!`);
+          await this.closePosition(pos);
+        }
       }
     }
   }
@@ -474,7 +482,7 @@ class PositionMonitor {
       try {
         const algoOrders = await this.api.getAlgoOrders(pos.symbol);
         for (const order of algoOrders) {
-          if (order.status === 'NEW') {
+          if (order.algoStatus === 'NEW') {
             await this.api.cancelAlgoOrder(pos.symbol, order.algoId);
           }
         }
