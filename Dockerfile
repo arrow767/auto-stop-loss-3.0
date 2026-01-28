@@ -1,19 +1,13 @@
-# Используем официальный образ Bun
-FROM oven/bun:1 AS base
+# Bun Alpine image for smaller size
+FROM oven/bun:1-alpine
 WORKDIR /app
 
-# Устанавливаем зависимости
-FROM base AS install
-COPY package.json bun.lock ./
-RUN bun install --frozen-lockfile
+# Copy and install deps
+COPY package.json bun.lockb* ./
+RUN bun install --frozen-lockfile || bun install
 
-# Копируем исходный код
-FROM base AS release
-COPY --from=install /app/node_modules ./node_modules
-COPY . .
+# Copy source
+COPY index.ts ./
 
-# Открываем порт для healthcheck
-EXPOSE 3000
-
-# Запускаем приложение
+# Run
 CMD ["bun", "run", "index.ts"]

@@ -1,18 +1,17 @@
 /**
- * Binance Futures Loss Guardian 3.0
+ * Binance Futures Loss Guardian 4.0
  *
  * Функционал:
  * 1. Мониторинг позиций каждые INTERVAL_MS
  * 2. Закрытие позиции при убытке >= MAX_LOSS_USD
  * 3. Проверка наличия SL (отдельный цикл SL_CHECK_INTERVAL_MS)
- * 4. Telegram уведомления о позициях без SL
+ * 4. Telegram бот с командами: /status /pause /resume
  *
  * Запуск: bun run index.ts
  */
 
 import crypto from 'crypto';
 import process from 'process';
-import { serve } from 'bun';
 
 // ===================== TYPES =====================
 
@@ -27,8 +26,8 @@ interface AlgoOrder {
   symbol: string;
   side: 'BUY' | 'SELL';
   quantity: string;
-  orderType: string;      // STOP_MARKET, etc
-  algoStatus: string;     // NEW, FILLED, etc
+  orderType: string;
+  algoStatus: string;
   closePosition?: boolean;
 }
 
@@ -48,11 +47,13 @@ const cfg = {
   recvWindow: parseInt(getEnv('RECV_WINDOW') || '5000'),
   maxLossUsd: parseFloat(getEnv('MAX_LOSS_USD') || '100'),
   dryRun: getEnv('DRY_RUN') === 'true',
-  healthcheckPort: parseInt(getEnv('HEALTHCHECK_PORT') || '3000'),
   telegramBotToken: getEnv('TELEGRAM_BOT_TOKEN'),
   telegramChatId: getEnv('TELEGRAM_CHAT_ID'),
   telegramInterval: parseInt(getEnv('TELEGRAM_NOTIFICATION_INTERVAL_MS') || '30000'),
 };
+
+// Состояние паузы (в памяти, сбрасывается при рестарте)
+let paused = false;
 
 function getEnv(key: string, required = false): string | undefined {
   const v = process.env[key];
@@ -67,45 +68,62 @@ function getEnv(key: string, required = false): string | undefined {
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
-const C = {
-  reset: '\x1b[0m',
-  red: '\x1b[31m',
-  green: '\x1b[32m',
-  yellow: '\x1b[33m',
-  cyan: '\x1b[36m',
-  dim: '\x1b[2m',
-};
+// ===================== LOGGING (compact for Render) =====================
+
+const LogLevel = { ERROR: 0, WARN: 1, INFO: 2 } as const;
+const LOG_LEVEL = LogLevel.INFO;
 
 function log(msg: string) {
-  const time = new Date().toLocaleTimeString('ru-RU');
-  console.log(`${C.dim}[${time}]${C.reset} ${msg}`);
+  if (LOG_LEVEL < LogLevel.INFO) return;
+  console.log(`[${ts()}] ${msg}`);
 }
 
 function logError(msg: string) {
-  const time = new Date().toLocaleTimeString('ru-RU');
-  console.log(`${C.red}[${time}] ERROR: ${msg}${C.reset}`);
+  console.log(`[${ts()}] ERR ${msg}`);
 }
 
 function logWarn(msg: string) {
-  const time = new Date().toLocaleTimeString('ru-RU');
-  console.log(`${C.yellow}[${time}] WARN: ${msg}${C.reset}`);
+  if (LOG_LEVEL < LogLevel.WARN) return;
+  console.log(`[${ts()}] WRN ${msg}`);
 }
 
 function logSuccess(msg: string) {
-  const time = new Date().toLocaleTimeString('ru-RU');
-  console.log(`${C.green}[${time}] ${msg}${C.reset}`);
+  console.log(`[${ts()}] OK ${msg}`);
 }
 
-function formatPnL(pnl: number): string {
-  const sign = pnl >= 0 ? '+' : '';
-  const color = pnl >= 0 ? C.green : C.red;
-  return `${color}${sign}${pnl.toFixed(2)}${C.reset}`;
+function ts(): string {
+  const d = new Date();
+  return `${d.getHours().toString().padStart(2, '0')}:${d.getMinutes().toString().padStart(2, '0')}:${d.getSeconds().toString().padStart(2, '0')}`;
+}
+
+// ===================== RETRY HELPER =====================
+
+async function retry<T>(
+  fn: () => Promise<T>,
+  opts: { attempts?: number; delayMs?: number; name?: string } = {}
+): Promise<T> {
+  const { attempts = 3, delayMs = 1000, name = 'operation' } = opts;
+  let lastError: Error | null = null;
+
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      return await fn();
+    } catch (e: any) {
+      lastError = e;
+      if (i < attempts) {
+        logWarn(`${name} failed (${i}/${attempts}), retry in ${delayMs}ms`);
+        await sleep(delayMs);
+      }
+    }
+  }
+
+  throw lastError;
 }
 
 // ===================== BINANCE API =====================
 
 class BinanceAPI {
-  private symbolInfo = new Map<string, number>(); // symbol -> stepSize precision
+  private symbolInfo = new Map<string, number>();
 
   private sign(query: string): string {
     return crypto.createHmac('sha256', cfg.apiSecret).update(query).digest('hex');
@@ -157,7 +175,6 @@ class BinanceAPI {
 
   async getAlgoOrders(symbol: string): Promise<AlgoOrder[]> {
     const res = await this.request<AlgoOrder[]>('GET', '/fapi/v1/openAlgoOrders', { symbol }, true);
-    // API возвращает массив напрямую, не объект с orders
     return Array.isArray(res) ? res : [];
   }
 
@@ -200,30 +217,45 @@ class BinanceAPI {
   }
 }
 
-// ===================== TELEGRAM =====================
+// ===================== TELEGRAM BOT =====================
 
-class Telegram {
-  private lastNotify = new Map<string, number>();
+interface StatusInfo {
+  positions: Array<{ symbol: string; pnl: number; hasSL: boolean | null }>;
+  errors: number;
+}
+
+class TelegramBot {
+  private lastUpdateId = 0;
   private configured: boolean;
+  private lastNotify = new Map<string, number>();
+  private polling = false;
 
-  constructor() {
+  constructor(private getStatus: () => StatusInfo) {
     this.configured = !!(cfg.telegramBotToken && cfg.telegramChatId);
     if (!this.configured) {
-      logWarn('Telegram не настроен (TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID отсутствуют)');
+      logWarn('Telegram не настроен');
     }
   }
 
-  async send(text: string): Promise<boolean> {
+  async send(text: string, keyboard?: any): Promise<boolean> {
     if (!this.configured) return false;
     try {
+      const body: any = {
+        chat_id: cfg.telegramChatId,
+        text,
+        parse_mode: 'HTML',
+      };
+      if (keyboard) {
+        body.reply_markup = JSON.stringify(keyboard);
+      }
       const res = await fetch(`https://api.telegram.org/bot${cfg.telegramBotToken}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: cfg.telegramChatId, text, parse_mode: 'HTML' }),
+        body: JSON.stringify(body),
       });
       return res.ok;
     } catch (e: any) {
-      logError(`Telegram: ${e.message}`);
+      logError(`Telegram send: ${e.message}`);
       return false;
     }
   }
@@ -241,6 +273,160 @@ class Telegram {
   clearSymbol(symbol: string) {
     this.lastNotify.delete(symbol);
   }
+
+  startPolling() {
+    if (!this.configured || this.polling) return;
+    this.polling = true;
+    log('Telegram бот запущен');
+    this.poll();
+  }
+
+  private async poll() {
+    while (this.polling) {
+      try {
+        const updates = await this.getUpdates();
+        for (const update of updates) {
+          await this.handleUpdate(update);
+        }
+      } catch (e: any) {
+        // Тихо игнорируем ошибки polling
+      }
+      await sleep(1000);
+    }
+  }
+
+  private async getUpdates(): Promise<any[]> {
+    try {
+      const res = await fetch(
+        `https://api.telegram.org/bot${cfg.telegramBotToken}/getUpdates?offset=${this.lastUpdateId + 1}&timeout=5`
+      );
+      const data = await res.json() as any;
+      if (data.ok && data.result) {
+        for (const u of data.result) {
+          if (u.update_id > this.lastUpdateId) {
+            this.lastUpdateId = u.update_id;
+          }
+        }
+        return data.result;
+      }
+    } catch (e) {}
+    return [];
+  }
+
+  private async handleUpdate(update: any) {
+    const msg = update.message;
+    const callback = update.callback_query;
+
+    if (callback) {
+      await this.handleCallback(callback);
+      return;
+    }
+
+    if (!msg?.text) return;
+
+    const chatId = msg.chat.id.toString();
+    if (chatId !== cfg.telegramChatId) return;
+
+    const text = msg.text.trim();
+    const cmd = text.split(/\s+/)[0].toLowerCase();
+
+    switch (cmd) {
+      case '/start':
+      case '/help':
+        await this.cmdHelp();
+        break;
+      case '/status':
+        await this.cmdStatus();
+        break;
+      case '/pause':
+        await this.cmdPause();
+        break;
+      case '/resume':
+        await this.cmdResume();
+        break;
+    }
+  }
+
+  private async handleCallback(callback: any) {
+    const data = callback.data;
+    if (!data) return;
+
+    try {
+      await fetch(`https://api.telegram.org/bot${cfg.telegramBotToken}/answerCallbackQuery`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ callback_query_id: callback.id }),
+      });
+    } catch (e) {}
+
+    if (data === 'status') await this.cmdStatus();
+    else if (data === 'pause') await this.cmdPause();
+    else if (data === 'resume') await this.cmdResume();
+  }
+
+  private async cmdHelp() {
+    await this.send(
+      `<b>Loss Guardian 4.0</b>\n\n` +
+      `<b>Команды:</b>\n` +
+      `/status - статус и позиции\n` +
+      `/pause - приостановить\n` +
+      `/resume - возобновить\n\n` +
+      `Max Loss: ${cfg.maxLossUsd} USDT`,
+      {
+        inline_keyboard: [
+          [{ text: '📊 Статус', callback_data: 'status' }],
+          [{ text: paused ? '▶️ Возобновить' : '⏸ Пауза', callback_data: paused ? 'resume' : 'pause' }],
+        ],
+      }
+    );
+  }
+
+  private async cmdStatus() {
+    const status = this.getStatus();
+    const posText = status.positions.length === 0
+      ? 'Нет позиций'
+      : status.positions.map(p => {
+          const pnl = p.pnl >= 0 ? `+${p.pnl.toFixed(2)}` : p.pnl.toFixed(2);
+          const sl = p.hasSL === true ? '✅' : p.hasSL === false ? '❌' : '❓';
+          return `${p.symbol}: ${pnl}$ ${sl}`;
+        }).join('\n');
+
+    await this.send(
+      `<b>📊 Статус</b>\n\n` +
+      `Состояние: ${paused ? '⏸ ПАУЗА' : '✅ Активен'}\n` +
+      `Макс. убыток: <b>${cfg.maxLossUsd} USDT</b>\n` +
+      `Ошибок: ${status.errors}\n\n` +
+      `<b>Позиции:</b>\n<code>${posText}</code>`,
+      {
+        inline_keyboard: [
+          [{ text: '🔄 Обновить', callback_data: 'status' }],
+          [{ text: paused ? '▶️ Возобновить' : '⏸ Пауза', callback_data: paused ? 'resume' : 'pause' }],
+        ],
+      }
+    );
+  }
+
+  private async cmdPause() {
+    paused = true;
+    await this.send(
+      `⏸ <b>Мониторинг приостановлен</b>\n\nПозиции НЕ будут закрываться автоматически.`,
+      {
+        inline_keyboard: [[{ text: '▶️ Возобновить', callback_data: 'resume' }]],
+      }
+    );
+    log('Мониторинг приостановлен через Telegram');
+  }
+
+  private async cmdResume() {
+    paused = false;
+    await this.send(
+      `▶️ <b>Мониторинг возобновлён</b>\n\nМакс. убыток: ${cfg.maxLossUsd} USDT`,
+      {
+        inline_keyboard: [[{ text: '📊 Статус', callback_data: 'status' }]],
+      }
+    );
+    log('Мониторинг возобновлён через Telegram');
+  }
 }
 
 // ===================== SL CHECKER =====================
@@ -255,12 +441,12 @@ class SLChecker {
   private running = false;
   private interval: ReturnType<typeof setInterval> | null = null;
 
-  constructor(private api: BinanceAPI, private telegram: Telegram, private getPositions: () => Position[]) {}
+  constructor(private api: BinanceAPI, private telegram: TelegramBot, private getPositions: () => Position[]) {}
 
   start() {
     if (this.running) return;
     this.running = true;
-    log(`SL Checker запущен (интервал: ${cfg.slCheckIntervalMs}ms)`);
+    log(`SL Checker started`);
     this.interval = setInterval(() => this.check(), cfg.slCheckIntervalMs);
     this.check();
   }
@@ -277,7 +463,6 @@ class SLChecker {
   private async check() {
     const positions = this.getPositions();
 
-    // Очищаем кеш для закрытых позиций
     for (const symbol of this.cache.keys()) {
       if (!positions.find(p => p.symbol === symbol)) {
         this.cache.delete(symbol);
@@ -293,23 +478,19 @@ class SLChecker {
         this.cache.set(pos.symbol, { hasSL, lastCheck: Date.now() });
 
         if (!hasSL) {
-          logWarn(`${pos.symbol} - НЕТ SL! PnL: ${formatPnL(pos.pnl)}`);
-
           if (this.telegram.shouldNotify(pos.symbol)) {
+            logWarn(`${pos.symbol} NO SL`);
             await this.telegram.send(
-              `⚠️ <b>${pos.symbol} БЕЗ СТОП-ЛОССА!</b>\n\n` +
-              `Сторона: ${pos.side}\n` +
-              `Размер: ${Math.abs(pos.amt)}\n` +
-              `PnL: ${pos.pnl.toFixed(2)} USDT\n\n` +
-              `Установите SL!`
+              `⚠️ <b>${pos.symbol} НЕТ SL</b>\n` +
+              `${pos.side} | ${pos.pnl.toFixed(2)}$`
             );
           }
         } else if (prev && !prev.hasSL) {
-          logSuccess(`${pos.symbol} - SL установлен`);
+          logSuccess(`${pos.symbol} SL ok`);
           this.telegram.clearSymbol(pos.symbol);
         }
       } catch (e: any) {
-        logError(`Проверка SL ${pos.symbol}: ${e.message}`);
+        // Ошибка сети - не обновляем кеш
       }
     }
   }
@@ -318,7 +499,6 @@ class SLChecker {
     const expectedSide = side === 'LONG' ? 'SELL' : 'BUY';
     let hasNetworkError = false;
 
-    // Проверяем algo orders (openAlgoOrders)
     try {
       const algoOrders = await this.api.getAlgoOrders(symbol);
       for (const order of algoOrders) {
@@ -326,21 +506,13 @@ class SLChecker {
         if (order.side !== expectedSide) continue;
         if (order.orderType !== 'STOP' && order.orderType !== 'STOP_MARKET') continue;
 
-        // SL найден если closePosition=true или есть quantity
-        if (order.closePosition === true) {
-          return true;
-        }
-        const hasQty = parseFloat(order.quantity || '0') > 0;
-        if (hasQty) {
-          return true;
-        }
+        if (order.closePosition === true) return true;
+        if (parseFloat(order.quantity || '0') > 0) return true;
       }
     } catch (e: any) {
-      // Ошибка сети - не можем проверить, пробрасываем ошибку
       hasNetworkError = true;
     }
 
-    // Проверяем обычные orders
     try {
       const orders = await this.api.getOpenOrders(symbol);
       for (const order of orders) {
@@ -350,19 +522,13 @@ class SLChecker {
 
         const closePos = order.closePosition === 'true' || order.closePosition === true;
         const hasQty = parseFloat(order.origQty || order.quantity || '0') > 0;
-        if (closePos || hasQty) {
-          return true;
-        }
+        if (closePos || hasQty) return true;
       }
     } catch (e: any) {
       hasNetworkError = true;
     }
 
-    // Если были ошибки сети и не нашли SL - бросаем ошибку чтобы показать [?]
-    if (hasNetworkError) {
-      throw new Error('Network error during SL check');
-    }
-
+    if (hasNetworkError) throw new Error('Network error');
     return false;
   }
 }
@@ -379,12 +545,12 @@ interface Position {
 class PositionMonitor {
   private positions: Position[] = [];
   private running = false;
-  private lastTick = 0;
   private errors = 0;
+  private lastPrint = 0;
 
   constructor(
     private api: BinanceAPI,
-    private telegram: Telegram,
+    private telegram: TelegramBot,
     private slChecker: SLChecker
   ) {}
 
@@ -392,21 +558,30 @@ class PositionMonitor {
     return this.positions;
   }
 
+  getStatusInfo(): StatusInfo {
+    return {
+      positions: this.positions.map(p => ({
+        symbol: p.symbol,
+        pnl: p.pnl,
+        hasSL: this.slChecker.getStatus(p.symbol)?.hasSL ?? null,
+      })),
+      errors: this.errors,
+    };
+  }
+
   async start() {
     this.running = true;
-    log(`Position Monitor запущен (интервал: ${cfg.intervalMs}ms, max loss: ${cfg.maxLossUsd} USDT)`);
+    log(`Monitor started (max loss: ${cfg.maxLossUsd}$)`);
 
     while (this.running) {
       try {
         await this.tick();
-        this.lastTick = Date.now();
         this.errors = 0;
       } catch (e: any) {
         this.errors++;
-        logError(`Tick: ${e.message}`);
-        // При множественных ошибках ждём дольше, но НЕ падаем
+        logError(`Tick: ${e.message.slice(0, 50)}`);
         if (this.errors >= 10) {
-          logWarn(`${this.errors} ошибок подряд, ждём 30 секунд...`);
+          logWarn(`${this.errors} errors, sleep 30s`);
           await sleep(30000);
         }
       }
@@ -418,25 +593,19 @@ class PositionMonitor {
     this.running = false;
   }
 
-  getHealth() {
-    return {
-      healthy: this.running && this.errors < 10,
-      lastTick: this.lastTick,
-      errors: this.errors,
-    };
-  }
-
   private async tick() {
     this.positions = await this.api.getPositions();
     this.printPositions();
 
+    // Если на паузе - не закрываем позиции
+    if (paused) return;
+
     for (const pos of this.positions) {
       // КРИТИЧНО: закрываем ТОЛЬКО если pnl отрицательный И убыток >= maxLoss
-      // pnl < 0 = убыток, pnl > 0 = прибыль
       if (pos.pnl < 0) {
-        const loss = Math.abs(pos.pnl);  // убыток как положительное число
+        const loss = Math.abs(pos.pnl);
         if (loss >= cfg.maxLossUsd) {
-          logError(`${pos.symbol} УБЫТОК ${loss.toFixed(2)} >= ${cfg.maxLossUsd} USDT - ЗАКРЫВАЕМ!`);
+          logError(`${pos.symbol} -${loss.toFixed(0)}$ >= ${cfg.maxLossUsd}$ CLOSING`);
           await this.closePosition(pos);
         }
       }
@@ -444,22 +613,21 @@ class PositionMonitor {
   }
 
   private printPositions() {
+    const now = Date.now();
+    if (now - this.lastPrint < 60000) return;
+    this.lastPrint = now;
+
     if (this.positions.length === 0) {
       log('Нет открытых позиций');
       return;
     }
 
-    console.log('');
     for (const pos of this.positions) {
       const slState = this.slChecker.getStatus(pos.symbol);
-      const slStr = slState
-        ? (slState.hasSL ? `${C.green}[SL]${C.reset}` : `${C.red}[NO SL]${C.reset}`)
-        : `${C.yellow}[?]${C.reset}`;
-
-      const dir = pos.side === 'LONG' ? '▲' : '▼';
-      log(`${pos.symbol.padEnd(12)} ${dir} ${pos.side.padEnd(5)} | amt: ${pos.amt.toFixed(4).padStart(12)} | PnL: ${formatPnL(pos.pnl).padStart(20)} | ${slStr}`);
+      const slStr = slState ? (slState.hasSL ? '[SL]' : '[NO SL]') : '[?]';
+      const pnlStr = pos.pnl >= 0 ? `+${pos.pnl.toFixed(2)}` : pos.pnl.toFixed(2);
+      log(`${pos.symbol} ${pos.side} | PnL: ${pnlStr} | ${slStr}`);
     }
-    console.log('');
   }
 
   private async closePosition(pos: Position) {
@@ -467,45 +635,50 @@ class PositionMonitor {
     const qty = await this.api.roundQty(pos.symbol, Math.abs(pos.amt));
 
     if (cfg.dryRun) {
-      logWarn(`[DRY RUN] Закрыли бы ${pos.symbol}: ${side} ${qty}`);
+      logWarn(`[DRY] ${pos.symbol} ${side} ${qty}`);
       return;
     }
 
+    // Отменяем ордера (без retry - не критично)
+    try { await this.api.cancelAllOrders(pos.symbol); } catch {}
     try {
-      // Отменяем все ордера
-      try {
-        await this.api.cancelAllOrders(pos.symbol);
-        log(`${pos.symbol} - ордера отменены`);
-      } catch (e) {}
-
-      // Отменяем algo ордера
-      try {
-        const algoOrders = await this.api.getAlgoOrders(pos.symbol);
-        for (const order of algoOrders) {
-          if (order.algoStatus === 'NEW') {
-            await this.api.cancelAlgoOrder(pos.symbol, order.algoId);
-          }
+      const algoOrders = await this.api.getAlgoOrders(pos.symbol);
+      for (const order of algoOrders) {
+        if (order.algoStatus === 'NEW') {
+          await this.api.cancelAlgoOrder(pos.symbol, order.algoId);
         }
-      } catch (e) {}
+      }
+    } catch {}
 
-      // Закрываем позицию
-      const result = await this.api.marketClose(pos.symbol, side, qty.toString());
-      logSuccess(`${pos.symbol} ЗАКРЫТ! OrderId: ${result.orderId}, Status: ${result.status}`);
-
-      // Telegram
-      await this.telegram.send(
-        `🚨 <b>ПОЗИЦИЯ ЗАКРЫТА: ${pos.symbol}</b>\n\n` +
-        `Причина: Убыток >= ${cfg.maxLossUsd} USDT\n` +
-        `PnL: ${pos.pnl.toFixed(2)} USDT\n` +
-        `Сторона: ${side}\n` +
-        `Количество: ${qty}\n` +
-        `Order ID: ${result.orderId}`
+    // КРИТИЧНО: закрытие позиции с retry
+    try {
+      const result = await retry(
+        () => this.api.marketClose(pos.symbol, side, qty.toString()),
+        { attempts: 3, delayMs: 500, name: `close ${pos.symbol}` }
       );
 
-      this.slChecker.getStatus(pos.symbol) && this.telegram.clearSymbol(pos.symbol);
+      // Проверяем статус ордера
+      if (result.status === 'FILLED') {
+        logSuccess(`${pos.symbol} closed #${result.orderId}`);
+        await this.telegram.send(
+          `🚨 <b>ЗАКРЫТО: ${pos.symbol}</b>\n` +
+          `PnL: ${pos.pnl.toFixed(2)}$ | #${result.orderId}`
+        );
+      } else if (result.status === 'PARTIALLY_FILLED' || result.status === 'NEW') {
+        logWarn(`${pos.symbol} order ${result.status} #${result.orderId}`);
+        await this.telegram.send(
+          `⚠️ <b>${pos.symbol} не полностью закрыт</b>\n` +
+          `Status: ${result.status} | #${result.orderId}`
+        );
+      } else {
+        logError(`${pos.symbol} unexpected status: ${result.status}`);
+        await this.telegram.send(
+          `❌ <b>${pos.symbol} статус: ${result.status}</b>\n#${result.orderId}`
+        );
+      }
     } catch (e: any) {
-      logError(`Не удалось закрыть ${pos.symbol}: ${e.message}`);
-      await this.telegram.send(`❌ <b>ОШИБКА закрытия ${pos.symbol}</b>\n\n${e.message}`);
+      logError(`FAILED ${pos.symbol}: ${e.message}`);
+      await this.telegram.send(`❌ <b>ОШИБКА ${pos.symbol}</b>\n${e.message.slice(0, 100)}`);
     }
   }
 }
@@ -514,33 +687,29 @@ class PositionMonitor {
 
 class LossGuardian {
   private api = new BinanceAPI();
-  private telegram = new Telegram();
+  private telegram: TelegramBot;
   private slChecker: SLChecker;
   private monitor: PositionMonitor;
 
   constructor() {
+    this.telegram = new TelegramBot(() => this.monitor.getStatusInfo());
     this.slChecker = new SLChecker(this.api, this.telegram, () => this.monitor.getPositions());
     this.monitor = new PositionMonitor(this.api, this.telegram, this.slChecker);
   }
 
   async start() {
-    console.log(`\n${C.cyan}═══════════════════════════════════════════════════════════${C.reset}`);
-    console.log(`${C.cyan}  Binance Loss Guardian 3.0${C.reset}`);
-    console.log(`${C.cyan}═══════════════════════════════════════════════════════════${C.reset}\n`);
-
+    log('═══════════════════════════════════════════');
+    log('  Binance Loss Guardian 4.0');
+    log('═══════════════════════════════════════════');
     log(`Max Loss: ${cfg.maxLossUsd} USDT`);
-    log(`Interval: ${cfg.intervalMs}ms`);
-    log(`SL Check: ${cfg.slCheckIntervalMs}ms`);
-    log(`Dry Run: ${cfg.dryRun ? 'YES' : 'NO'}`);
-    console.log('');
 
     await this.telegram.send(
-      `🚀 <b>Loss Guardian 3.0 запущен</b>\n\n` +
+      `🚀 <b>Loss Guardian 4.0 запущен</b>\n\n` +
       `Max Loss: ${cfg.maxLossUsd} USDT\n` +
-      `Interval: ${cfg.intervalMs}ms\n` +
-      `Dry Run: ${cfg.dryRun ? 'Да' : 'Нет'}`
+      `Состояние: Активен`
     );
 
+    this.telegram.startPolling();
     this.slChecker.start();
     await this.monitor.start();
   }
@@ -549,31 +718,12 @@ class LossGuardian {
     this.slChecker.stop();
     this.monitor.stop();
   }
-
-  getHealth() {
-    return this.monitor.getHealth();
-  }
 }
-
-// ===================== HEALTHCHECK SERVER =====================
-
-let guardian: LossGuardian;
-
-serve({
-  port: cfg.healthcheckPort,
-  fetch(req) {
-    const health = guardian?.getHealth() || { healthy: false };
-    return new Response(JSON.stringify(health), {
-      status: health.healthy ? 200 : 503,
-      headers: { 'Content-Type': 'application/json' },
-    });
-  },
-});
 
 // ===================== BOOTSTRAP =====================
 
 async function main() {
-  guardian = new LossGuardian();
+  const guardian = new LossGuardian();
 
   process.on('SIGINT', () => {
     log('Завершение...');
@@ -590,7 +740,16 @@ async function main() {
   await guardian.start();
 }
 
-main().catch(e => {
-  logError(`Fatal: ${e.message}`);
-  process.exit(1);
-});
+async function runForever() {
+  while (true) {
+    try {
+      await main();
+    } catch (e: any) {
+      logError(`Fatal: ${e.message.slice(0, 80)}`);
+      logWarn('Restart in 10s');
+      await sleep(10000);
+    }
+  }
+}
+
+runForever();
